@@ -1,0 +1,115 @@
+#!/usr/bin/env suidperl -T
+
+=for comment
+
+firewall whitelisting CGI
+by Jon Jensen <jon@endpoint.com>
+2005-03-04
+
+Add these rules somewhere in your iptables configuration file,
+before your drop rules:
+
+-N dynamic_ip
+-A INPUT -j dynamic_ip
+
+=cut
+
+
+use warnings;
+no warnings 'qw';
+use strict;
+use Sys::Syslog;
+
+
+my $table = 'dynamic_ip';
+my $iptables = '/sbin/iptables';
+
+
+#my $out = join "\n", map { "$_=$ENV{$_}" } sort keys %ENV;
+
+# Save important things before clearing tainted environment
+my $ip = $ENV{REMOTE_ADDR};
+my $user = $ENV{REMOTE_USER};
+my $secure = $ENV{HTTPS};
+my $uri = $ENV{SCRIPT_URI};
+%ENV = ();
+
+openlog 'firewall CGI', 'pid nowait', 'LOG_AUTHPRIV';
+announce("Connection from $ip by $user");
+
+perish("This application may only be accessed with SSL encryption.\n")
+	unless $secure;
+
+$ip =~ /^(\d+\.\d+\.\d+\.\d+)$/;
+@_ = split /\./, $1 || '';
+my @ip;
+for (@_) {
+	push @ip, $_ if $_ < 256;
+}
+perish("Invalid IP address\n")
+	unless @ip == 4;
+$ip = join '.', @ip;
+perish("Devious IP address: $ip\n")
+	if $ip eq '0.0.0.0' or $ip eq '255.255.255.255';
+
+my $msg;
+if (`$iptables -L $table -n` =~ /\Q$ip/) {
+	$msg = <<END;
+Your IP address, $ip, was already whitelisted in the firewall.
+Go ahead and
+END
+	announce("IP was already whitelisted");
+}
+else {
+	my @base = ($iptables, '-A', $table, '-s', $ip);
+	for (
+		[qw( -p tcp -m multiport --dports 21,22 -j ACCEPT )],
+	) {
+		system(@base, @$_) == 0 or perish("Error: $!\n");
+	}
+	$msg = <<END;
+Your IP address, $ip, has been added to the firewall whitelist.
+You should now be able to
+END
+	announce("IP has been added to whitelist");
+}
+
+print <<END;
+Content-type: text/html\r
+\r
+
+<html>
+<head>
+	<title>End Point Firewall</title>
+</head>
+<body>
+
+<h1>End Point Firewall</h1>
+
+<p>
+$msg
+access the firewalled ports on the server.
+</p>
+
+<p>
+Please email support if you run into any problems.
+</p>
+
+</body>
+</html>
+END
+
+closelog;
+exit 0;
+
+
+sub announce {
+	syslog 'LOG_NOTICE', '%s', @_;
+	return;
+}
+
+sub perish {
+	syslog 'LOG_ERR', '%s', @_;
+	closelog;
+	die @_;
+}

@@ -1,0 +1,451 @@
+#!/usr/bin/env perl -T
+
+=for comment
+
+firewall whitelisting CGI program
+by Jon Jensen <jon@endpoint.com>
+
+2005-03-04 - created
+2005-12-09 - support multiple host iptables changes
+2006-05-26 - support groups of users each with different server access
+2006-07-06 - tolerate groups without URLs in HTML output
+2006-09-20 - adapt for OpenBSD and pf tables on the local machine
+2006-09-21 - daemonize and make listen on UNIX socket to avoid need for suidperl
+2006-09-22 - re-unify and run under sudo
+2007-03-16 - switch to CGI-based authentication instead of HTTP basic auth;
+             limit number of bad attempts per user; quell pfctl success message;
+2007-06-29 - added support for remote pf firewall rule setting
+2008-04-02 - adapted for End Point by Kiel Christofferson;
+             added support for multiple commands per iptables run
+2011-02-16 - added pastebot access
+2011-12-28 - added use of COMMENT module with a timestamp
+next       - allow user to change password; allow admin to force user to change password
+
+=cut
+
+use warnings;
+no warnings 'qw';
+use strict;
+use IO::Handle;
+use Sys::Syslog qw(:DEFAULT setlogsock);
+use CGI ();
+use Digest::MD5 qw(md5_hex);
+use Authen::Htpasswd ();
+use DB_File;
+
+my $now_string = time();
+
+# authentication settings
+my $max_failed_attempts = 3;
+my $access_path = '/home/firewall/access';
+my $users_file = "$access_path/firewall.users";
+my $groups_file = "$access_path/firewall.groups";
+my $user_attempts_file = '/var/log/httpd/firewall.users.failed.attempts';
+my $email = 'someone@your.domain';
+
+# firewall opening settings
+my $command_timeout_seconds = 20;
+my $iptables = '/sbin/iptables';
+my $pfctl = '/sbin/pfctl';
+my $ssh = '/usr/bin/ssh';
+my $ssh_key = '/root/.ssh/id_rsa.firewall-whitelist';
+
+*STDOUT->autoflush(1);
+*STDERR->autoflush(1);
+
+die "This application may only be accessed via https.\n"
+	unless $ENV{HTTPS};
+
+my $ip = $ENV{REMOTE_ADDR};
+my $q = CGI->new;
+my @params = $q->param;
+my $action = $q->param('firewall_action');
+my $user = $q->param( grep /^firewall_user_/, @params );
+my $pass = $q->param( grep /^firewall_pass_/, @params );
+
+# clear tainted environment
+%ENV = ();
+
+setlogsock 'unix';
+openlog 'firewall CGI', 'pid nowait', 'LOG_AUTH';
+
+
+# Validate source IP address
+
+if (! $ip) {
+	perish("Connection is missing IP address\n");
+}
+elsif ($ip =~ /^(\d+\.\d+\.\d+\.\d+)$/) {
+	@_ = split /\./, $1 || '';
+	my @ip;
+	for (@_) {
+		push @ip, $_ if $_ < 256;
+	}
+	perish("Invalid IP address\n")
+		unless @ip == 4;
+	$ip = join '.', @ip;
+	perish("Devious IP address: $ip\n")
+		if $ip eq '0.0.0.0' or $ip eq '255.255.255.255';
+	announce("Connection reported from $ip");
+}
+else {
+	perish("Connection from invalid IP address '$ip'\n");
+}
+
+
+# Deal with dual page personality:
+# ask for user info vs. process and open firewalls
+
+my $msg = '';
+my $problems = ' if you run into any problems';
+
+my $pwfile = Authen::Htpasswd->new($users_file, { encrypt_hash => 'sha1' })
+	or perish("Error connecting to password file $users_file\n");
+
+tie my %user_attempts, 'DB_File', $user_attempts_file
+	or perish("Error tie-ing $user_attempts_file\n");
+
+if (! $action) {
+	announce("Initial connection made (no action specified)\n");
+	ask_for_id();
+}
+elsif ($action eq 'Log in') {
+	authenticate() and open_firewalls();
+}
+elsif ($action eq 'change_password') {
+	authenticate() and change_password();
+}
+else {
+	perish("Invalid form action attempted: $action\n");
+}
+
+
+# Return HTML page
+
+my $page_title = 'End Point Firewall';
+
+print $q->header,
+	$q->start_html($page_title),
+	$q->h1($page_title),
+	$msg,
+	$q->p(
+		$q->small('[' . $$ . ($user ? ' | ' . $user : '') . ']')
+	),
+	$q->end_html;
+
+
+# Done!
+
+untie %user_attempts
+	or perish("Error untie-ing file $user_attempts_file!\n");
+
+announce("HTML response sent and all done");
+closelog;
+exit;
+
+
+# Utility routines
+
+sub announce {
+	syslog 'LOG_NOTICE', '%s', @_;
+	return;
+}
+
+sub error {
+	syslog 'LOG_ERR', '%s', @_;
+	return;
+}
+
+sub perish {
+	syslog 'LOG_ERR', '%s', @_;
+	closelog;
+	die @_;
+}
+
+sub system_error_string {
+	my ($ret) = @_;
+	my $msg;
+	if ($ret == -1) {
+		$msg = "failed to execute: $!\n";
+	}
+	elsif ($ret & 127) {
+		$msg = sprintf "child died with signal %d, %s coredump\n",
+			($ret & 127), ($ret & 128) ? 'with' : 'without';
+	}
+	else {
+		$msg = sprintf "child exited with value %d\n", $ret >> 8;
+	}
+	return $msg;
+}
+
+
+# Authenticate the user
+
+sub authenticate {
+	# make sure user's not failed too many times
+	my $attempts = ++$user_attempts{$user};
+	if ($attempts > $max_failed_attempts) {
+		$msg .= $q->p(qq{Your account is locked due to too many failed login attempts. <b>Your account will be automatically unlocked after 30 minutes. Please wait 30 minutes and try again.</b> If you are still unable to log in, contact support.});
+		announce("Refused to try authentication for user '$user' because $attempts attempts have been made (limit of $max_failed_attempts allowed).\n");
+ 		$problems = ' to have your account unlocked';
+		return;
+	}
+
+	# check user + password
+	my $valid;
+	eval {
+		$valid = $pwfile->check_user_password($user, $pass);
+	};
+	undef $valid if $@;
+	unless ($valid) {
+		my $lockout = ($attempts >= $max_failed_attempts);
+		my $m = 'The username and password you provided are incorrect.';
+		$m .= ' Your account has now been locked due to too many failed login attempts. <b>Your account will be automatically unlocked after 30 minutes. Please wait 30 minutes and try again.</b> If you are still unable to log in, '
+			if $lockout;
+		$msg .= $q->p($m);
+		ask_for_id() unless $lockout;
+		$problems = ' to have your account unlocked';
+		announce(
+			"Authentication for user '$user' failed"
+			. ($lockout
+				? " and account is now locked because the limit of"
+					. " $max_failed_attempts failed attempts has been reached"
+				: '')
+			. '.'
+		);
+		return;
+	}
+
+	announce("User '$user' authenticated.");
+
+	# reset failed attempt counter
+	$user_attempts{$user} = 0;
+
+	return 1;
+}
+
+
+# Open the firewall(s)
+
+sub open_firewalls {
+
+	perish("open_firewalls called with no user specified!\n")
+		unless $user;
+
+
+	# Find out which groups the user is in
+
+	my %in_group;
+	{
+		local @ARGV = $groups_file;
+		while (<>) {
+			next if /^\s*$/ or /^\s*#/;
+			my ($group, $users) = /^\s*(\w+)\s*:\s*(.*)/
+				or perish("Invalid groups file\n");
+			$in_group{$group} = 1 if $users =~ /\b$user\b/;
+		}
+	}
+
+
+	# Define the various hosts and firewall rules
+
+	my @iptables_base = ($iptables, '-A', 'dynamic_ip', '-s', $ip);
+
+    my $user = $1 if $user =~ /^(\w+)$/; # untaint
+	my %host_rules = (
+		everything => [
+			[
+				'iptables', 'localhost',
+                '-p tcp -m multiport --dports 22,80,443,5432 -j ACCEPT',
+			],
+			[
+				'iptables', 'some.remote.host',
+				'-p tcp -m multiport --dports 22,80,443,8900:9199 -m comment --comment "whitelist-' . $user . '-' . $now_string . '" -j ACCEPT',
+				'-p udp -m multiport --dports 5060,5070,5080 -m comment --comment "whitelist-' . $user . '-' . $now_string . '" -j ACCEPT',
+			],
+		],
+		monitor => [
+			[
+				'iptables', 'another.remote.host',
+				'-p tcp -m multiport --dports 22,80,443 -m comment --comment "whitelist-' . $user . '-' . $now_string . '" -j ACCEPT',
+			],
+		],
+	);
+
+
+	# Open the appropriate firewall(s) for this user
+
+	my (%success, %errors);
+
+	for my $group (keys %in_group) {
+		my $argset = $host_rules{$group} or die "Missing rules for host $group?\n";
+		for my $args (@$argset) {
+			my $fw   = shift @$args;
+			my $host = shift @$args;
+
+			my (@cmd, $ret);
+
+			if ($fw eq 'pf') {
+				@cmd = ($pfctl, '-q', '-t', $group, '-T', 'add', $ip);
+			}
+			elsif ($fw eq 'iptables') {
+				@cmd = join('; ', map { join(' ', @iptables_base) . ' ' . $_ } @$args);
+			}
+			else {
+				die "Unknown firewall type in host_rules: $fw\n";
+			}
+
+			if ($host eq 'localhost') {
+				$ret = system(@cmd);
+			}
+			else {
+				undef $ret;
+				my $pid = fork;
+				if (! defined $pid) {
+					die "Couldn't fork: $!\n";
+				}
+				elsif (! $pid) {
+					# child
+					exec(
+						$ssh,
+						'-axqT',
+						'-o', 'BatchMode=yes',
+						'-i', $ssh_key,
+						'-l', 'root',
+						$host,
+						join(' ', @cmd),
+					);
+				}
+				# parent
+				$ret = $?;
+				eval {
+					local $SIG{ALRM} = sub { kill 15, $pid; die "timeout\n" };
+					alarm $command_timeout_seconds;
+					waitpid $pid, 0;
+					alarm 0;
+				};
+				$ret = $@ if $@;
+			}
+
+			if ($ret) {
+				if ($ret eq 'b0rken') {
+					error("Error with $host: access to this is broken right now\n");
+				}
+				elsif ($ret and $ret !~ /^-?\d+$/) {
+					error("Error with $host: $ret\n");
+				}
+				else {
+					error("Error with $host: " . system_error_string($?) . "\n");
+				}
+				++$errors{$group};
+			}
+			else {
+				++$success{$group};
+				my $logmsg = "IP has been added to $host";
+				$logmsg .= '/' . $group if $host eq 'localhost';
+				$logmsg .= ' whitelist';
+				announce($logmsg);
+			}
+		}
+	}
+
+
+	if (%errors) {
+		if (%success) {
+			$msg .= $q->p(
+				"Your IP address, $ip, has been added or re-added to the firewall"
+				. " whitelist of these servers: "
+				. join(', ', sort keys %success) . "."
+			);
+			$msg .= $q->p(
+				"But there were errors for these servers: " . join(', ', sort keys %errors) . "."
+			);
+		}
+		else {
+			$msg .= $q->p(
+				"There were errors adding your IP address, $ip, to the firewall whitelist."
+			);
+		}
+		$problems = ' about this problem';
+	}
+	elsif (! %success) {
+		$msg .= $q->p(
+			"You are not part of any access groups. Please have your manager contact"
+			. " the system administrator so you can be added to the appropriate group(s)."
+		);
+	}
+	else {
+		$msg .= $q->p(
+			"Your IP address, $ip, has been added or re-added to the firewall whitelist"
+			. " of these servers: "
+			. join(', ', sort keys %success) . "."
+		);
+	}
+
+	if (%success) {
+		$msg .= $q->p(
+			"You should now be able to access "
+			. ($errors{everything} ? "some of " : '')
+			. "these sites or site groups:"
+		);
+		$msg .= "<ul>\n";
+		my %sites = (
+			site1 => 'https://your.site1/',
+			site2 => 'https://your.site2/',
+		);
+		@success{keys %sites} = values %sites if grep { $_ eq 'everything' } keys %success;
+		for my $item (sort keys %success) {
+			$item = qq{<a href="$sites{$item}">$item</a>} if $sites{$item};
+			$item = "<li>$item</li>\n";
+			$msg .= $item;
+		}
+		$msg .= "</ul>\n";
+	}
+
+	return;
+
+}
+
+
+sub ask_for_id {
+
+	# defeat browser form data caching by using new field names each time
+	my $uid = md5_hex($$ . time() . 's33kritz');
+
+	$msg .= $q->start_form(-action => '')
+		. $q->table(
+			$q->Tr(
+				$q->td('Username:'),
+				$q->td($q->textfield({ -name => 'firewall_user_' . $uid, -size => 20 })),
+			),
+			$q->Tr(
+				$q->td('Password:'),
+				$q->td($q->password_field({ -name => 'firewall_pass_' . $uid, -size => 20 })),
+			),
+			$q->Tr({ -colspan => 2 },
+				$q->td($q->submit({ -name => 'firewall_action', value => 'Log in' })),
+			),
+		)
+		. $q->end_form;
+
+	return;
+
+}
+
+
+=for skip
+
+sub update_password {
+
+	my $ok;
+	eval {
+		$pwfile->update_user($user, $new_pass, 'changed=' . time());
+	};
+	undef $ok if $@;
+	perish("Error changing password for user '$user'\n") unless $ok;
+
+	return;
+
+}
+
+=cut

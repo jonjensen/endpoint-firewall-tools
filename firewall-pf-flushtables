@@ -1,0 +1,5 @@
+#!/bin/sh
+
+for i in everything somethingelse; do
+    pfctl -t $i -T flush
+done

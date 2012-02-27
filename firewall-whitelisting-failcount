@@ -1,0 +1,62 @@
+#!/usr/bin/env perl
+
+# clear failed user login attempt counter
+# by Jon Jensen <jon@endpoint.com>
+# March 2007
+
+use warnings;
+use strict;
+use DB_File;
+use Getopt::Std;
+use IO::Handle;
+
+*STDOUT->autoflush(1);
+*STDERR->autoflush(1);
+
+my $user_attempts_file = '/var/log/httpd/firewall.users.failed.attempts';
+
+my %opts;
+getopts('lzdh?', \%opts);
+
+tie my %user_attempts, 'DB_File', $user_attempts_file
+	or die "Error tie-ing $user_attempts_file\n";
+
+my @users = @ARGV;
+
+if ($opts{h} or $opts{'?'} or ! %opts) {
+	print STDERR <<'END';
+Usage: firewall.failcount [-l] [-z] [-d] [user] [user...]
+
+-l list counter
+-z zero user counter
+-d delete user entry
+
+If no users are specified, act on all users.
+END
+	exit 1;
+}
+
+@users = sort keys %user_attempts unless @users;
+
+for my $user (@users) {
+	my $count = $user_attempts{$user};
+	print "$user: ";
+	if (! defined $count) {
+		print "no counter\n";
+	}
+	else {
+		print $count;
+		if ($opts{d}) {
+			delete $user_attempts{$user};
+			print ' - deleted';
+		}
+		elsif ($opts{z} and $count) {
+			$user_attempts{$user} = 0;
+			print ' - reset to 0';
+		}
+		print "\n";
+	}
+}
+
+untie %user_attempts
+	or die "Error untie-ing file $user_attempts_file!\n";
