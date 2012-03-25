@@ -19,13 +19,17 @@ by Jon Jensen <jon@endpoint.com>
              added support for multiple commands per iptables run
 2011-02-16 - added pastebot access
 2011-12-28 - added use of COMMENT module with a timestamp
+2012-03-24 - remove trailing \n from syslog messages where it appears as \012
+           - start phasing out CGI module
+           - move to HTML5, don't cache, auto-select username field, turn off browser autocomplete
 next       - allow user to change password; allow admin to force user to change password
 
 =cut
 
+use strict;
 use warnings;
 no warnings 'qw';
-use strict;
+use utf8;
 use IO::Handle;
 use Sys::Syslog qw(:DEFAULT setlogsock);
 use CGI ();
@@ -33,7 +37,7 @@ use Digest::MD5 qw(md5_hex);
 use Authen::Htpasswd ();
 use DB_File;
 
-my $now_string = time();
+my $now_time = time();
 
 # authentication settings
 my $max_failed_attempts = 3;
@@ -44,7 +48,7 @@ my $user_attempts_file = '/var/log/httpd/firewall.users.failed.attempts';
 my $email = 'someone@your.domain';
 
 # firewall opening settings
-my $command_timeout_seconds = 20;
+my $command_timeout_seconds = 10;
 my $iptables = '/sbin/iptables';
 my $pfctl = '/sbin/pfctl';
 my $ssh = '/usr/bin/ssh';
@@ -60,8 +64,8 @@ my $ip = $ENV{REMOTE_ADDR};
 my $q = CGI->new;
 my @params = $q->param;
 my $action = $q->param('firewall_action');
-my $user = $q->param( grep /^firewall_user_/, @params );
-my $pass = $q->param( grep /^firewall_pass_/, @params );
+my $user = $q->param('firewall_user');
+my $pass = $q->param('firewall_pass');
 
 # clear tainted environment
 %ENV = ();
@@ -73,7 +77,7 @@ openlog 'firewall CGI', 'pid nowait', 'LOG_AUTH';
 # Validate source IP address
 
 if (! $ip) {
-	perish("Connection is missing IP address\n");
+	perish("Connection is missing IP address");
 }
 elsif ($ip =~ /^(\d+\.\d+\.\d+\.\d+)$/) {
 	@_ = split /\./, $1 || '';
@@ -81,32 +85,33 @@ elsif ($ip =~ /^(\d+\.\d+\.\d+\.\d+)$/) {
 	for (@_) {
 		push @ip, $_ if $_ < 256;
 	}
-	perish("Invalid IP address\n")
+	perish("Invalid IP address")
 		unless @ip == 4;
 	$ip = join '.', @ip;
-	perish("Devious IP address: $ip\n")
+	perish("Devious IP address: $ip")
 		if $ip eq '0.0.0.0' or $ip eq '255.255.255.255';
 	announce("Connection reported from $ip");
 }
 else {
-	perish("Connection from invalid IP address '$ip'\n");
+	perish("Connection from invalid IP address '$ip'");
 }
 
 
 # Deal with dual page personality:
 # ask for user info vs. process and open firewalls
 
-my $msg = '';
+my $onload = '';
+my @msg;
 my $problems = ' if you run into any problems';
 
 my $pwfile = Authen::Htpasswd->new($users_file, { encrypt_hash => 'sha1' })
-	or perish("Error connecting to password file $users_file\n");
+	or perish("Error connecting to password file $users_file");
 
 tie my %user_attempts, 'DB_File', $user_attempts_file
-	or perish("Error tie-ing $user_attempts_file\n");
+	or perish("Error tie-ing $user_attempts_file");
 
 if (! $action) {
-	announce("Initial connection made (no action specified)\n");
+	announce("Initial connection made (no action specified)");
 	ask_for_id();
 }
 elsif ($action eq 'Log in') {
@@ -116,28 +121,94 @@ elsif ($action eq 'change_password') {
 	authenticate() and change_password();
 }
 else {
-	perish("Invalid form action attempted: $action\n");
+	perish("Invalid form action attempted: $action");
 }
 
 
 # Return HTML page
 
 my $page_title = 'End Point Firewall';
+my $msg = join '', @msg;
 
-print $q->header,
-	$q->start_html($page_title),
-	$q->h1($page_title),
-	$msg,
-	$q->p(
-		$q->small('[' . $$ . ($user ? ' | ' . $user : '') . ']')
-	),
-	$q->end_html;
+print "Content-Type: text/html; charset=UTF-8\r\n";
+print "Cache-Control: private, no-store, no-cache\r\n";
+print "X-UA-Compatible: IE=edge,chrome=1\r\n";
+print "\r\n";
+
+print <<END;
+<!doctype html>
+<!-- paulirish.com/2008/conditional-stylesheets-vs-css-hacks-answer-neither/ -->
+<!--[if lt IE 7]> <html class="no-js lt-ie9 lt-ie8 lt-ie7" lang="en"> <![endif]-->
+<!--[if IE 7]>    <html class="no-js lt-ie9 lt-ie8" lang="en"> <![endif]-->
+<!--[if IE 8]>    <html class="no-js lt-ie9" lang="en"> <![endif]-->
+<!--[if gt IE 8]><!--> <html class="no-js" lang="en"> <!--<![endif]-->
+
+<head>
+	<title>$page_title</title>
+	<style type="text/css">
+html { font-size: 100%; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
+html, button, input, select, textarea { font-family: sans-serif; color: #222; }
+body { margin: 1em; font-size: 1em; line-height: 1.4; }
+::-moz-selection { background: #fe57a1; color: #fff; text-shadow: none; }
+::selection { background: #fe57a1; color: #fff; text-shadow: none; }
+a { color: #00e; }
+a:visited { color: #551a8b; }
+a:hover { color: #06e; }
+a:focus { outline: thin dotted; }
+a:hover, a:active { outline: 0; }
+abbr[title] { border-bottom: 1px dotted; }
+b, strong { font-weight: bold; }
+blockquote { margin: 1em 40px; }
+dfn { font-style: italic; }
+hr { display: block; height: 1px; border: 0; border-top: 1px solid #ccc; margin: 1em 0; padding: 0; }
+ins { background: #ff9; color: #000; text-decoration: none; }
+mark { background: #ff0; color: #000; font-style: italic; font-weight: bold; }
+pre, code, kbd, samp { font-family: monospace, serif; _font-family: 'courier new', monospace; font-size: 1em; }
+pre { white-space: pre; white-space: pre-wrap; word-wrap: break-word; }
+q { quotes: none; }
+q:before, q:after { content: ""; content: none; }
+small { font-size: 85%; }
+sub, sup { font-size: 75%; line-height: 0; position: relative; vertical-align: baseline; }
+sup { top: -0.5em; }
+sub { bottom: -0.25em; }
+ul, ol { margin: 1em 0; padding: 0 0 0 40px; }
+dd { margin: 0 0 0 40px; }
+nav ul, nav ol { list-style: none; list-style-image: none; margin: 0; padding: 0; }
+img { border: 0; -ms-interpolation-mode: bicubic; vertical-align: middle; }
+svg:not(:root) { overflow: hidden; }
+figure { margin: 0; }
+form { margin: 0; }
+fieldset { border: 0; margin: 0; padding: 0; }
+label { cursor: pointer; }
+legend { border: 0; *margin-left: -7px; padding: 0; white-space: normal; }
+button, input, select, textarea { font-size: 100%; margin: 0; vertical-align: baseline; *vertical-align: middle; }
+button, input { line-height: normal; }
+button, input[type="button"], input[type="reset"], input[type="submit"] { cursor: pointer; -webkit-appearance: button; *overflow: visible; }
+button[disabled], input[disabled] { cursor: default; }
+input[type="checkbox"], input[type="radio"] { box-sizing: border-box; padding: 0; *width: 13px; *height: 13px; }
+input[type="search"] { -webkit-appearance: textfield; -moz-box-sizing: content-box; -webkit-box-sizing: content-box; box-sizing: content-box; }
+input[type="search"]::-webkit-search-decoration, input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
+button::-moz-focus-inner, input::-moz-focus-inner { border: 0; padding: 0; }
+textarea { overflow: auto; vertical-align: top; resize: vertical; }
+input:valid, textarea:valid {  }
+input:invalid, textarea:invalid { background-color: #f0dddd; }
+table { border-collapse: collapse; border-spacing: 0; }
+td { vertical-align: top; }
+	</style>
+</head>
+
+<body$onload>
+	<h1>$page_title</h1>
+	$msg
+</body>
+</html>
+END
 
 
 # Done!
 
 untie %user_attempts
-	or perish("Error untie-ing file $user_attempts_file!\n");
+	or perish("Error untie-ing file $user_attempts_file!");
 
 announce("HTML response sent and all done");
 closelog;
@@ -147,35 +218,19 @@ exit;
 # Utility routines
 
 sub announce {
-	syslog 'LOG_NOTICE', '%s', @_;
+	syslog 'LOG_NOTICE', '%s', $_[0];
 	return;
 }
 
 sub error {
-	syslog 'LOG_ERR', '%s', @_;
+	syslog 'LOG_ERR', '%s', $_[0];
 	return;
 }
 
 sub perish {
-	syslog 'LOG_ERR', '%s', @_;
+	syslog 'LOG_ERR', '%s', $_[0];
 	closelog;
 	die @_;
-}
-
-sub system_error_string {
-	my ($ret) = @_;
-	my $msg;
-	if ($ret == -1) {
-		$msg = "failed to execute: $!\n";
-	}
-	elsif ($ret & 127) {
-		$msg = sprintf "child died with signal %d, %s coredump\n",
-			($ret & 127), ($ret & 128) ? 'with' : 'without';
-	}
-	else {
-		$msg = sprintf "child exited with value %d\n", $ret >> 8;
-	}
-	return $msg;
 }
 
 
@@ -185,9 +240,9 @@ sub authenticate {
 	# make sure user's not failed too many times
 	my $attempts = ++$user_attempts{$user};
 	if ($attempts > $max_failed_attempts) {
-		$msg .= $q->p(qq{Your account is locked due to too many failed login attempts. <b>Your account will be automatically unlocked after 30 minutes. Please wait 30 minutes and try again.</b> If you are still unable to log in, contact support.});
-		announce("Refused to try authentication for user '$user' because $attempts attempts have been made (limit of $max_failed_attempts allowed).\n");
- 		$problems = ' to have your account unlocked';
+		push @msg, qq{<p>Your account is locked due to too many failed login attempts. <b>It will be automatically unlocked within 30 minutes. Please wait and try again.</b> If you are still unable to log in, contact your manager.</p>};
+		announce("Refused user '$user' because $attempts attempts have been made (limit of $max_failed_attempts allowed).");
+		$problems = ' to have your account unlocked';
 		return;
 	}
 
@@ -202,7 +257,7 @@ sub authenticate {
 		my $m = 'The username and password you provided are incorrect.';
 		$m .= ' Your account has now been locked due to too many failed login attempts. <b>Your account will be automatically unlocked after 30 minutes. Please wait 30 minutes and try again.</b> If you are still unable to log in, '
 			if $lockout;
-		$msg .= $q->p($m);
+		push @msg, qq{<p>$m</p>};
 		ask_for_id() unless $lockout;
 		$problems = ' to have your account unlocked';
 		announce(
@@ -229,7 +284,7 @@ sub authenticate {
 
 sub open_firewalls {
 
-	perish("open_firewalls called with no user specified!\n")
+	perish("open_firewalls called with no user specified!")
 		unless $user;
 
 
@@ -241,7 +296,7 @@ sub open_firewalls {
 		while (<>) {
 			next if /^\s*$/ or /^\s*#/;
 			my ($group, $users) = /^\s*(\w+)\s*:\s*(.*)/
-				or perish("Invalid groups file\n");
+				or perish("Invalid groups file");
 			$in_group{$group} = 1 if $users =~ /\b$user\b/;
 		}
 	}
@@ -251,23 +306,19 @@ sub open_firewalls {
 
 	my @iptables_base = ($iptables, '-A', 'dynamic_ip', '-s', $ip);
 
-    my $user = $1 if $user =~ /^(\w+)$/; # untaint
+	my $user = $1 if $user =~ /^(\w+)$/; # untaint
+	my $iptables_comment = '-m comment --comment "whitelist-' . $user . '-' . $now_time . '"';
 	my %host_rules = (
-		everything => [
+		bastion => [
 			[
 				'iptables', 'localhost',
-                '-p tcp -m multiport --dports 22,80,443,5432 -j ACCEPT',
-			],
-			[
-				'iptables', 'some.remote.host',
-				'-p tcp -m multiport --dports 22,80,443,8900:9199 -m comment --comment "whitelist-' . $user . '-' . $now_string . '" -j ACCEPT',
-				'-p udp -m multiport --dports 5060,5070,5080 -m comment --comment "whitelist-' . $user . '-' . $now_string . '" -j ACCEPT',
+				"-p tcp --dport 22 $iptables_comment -j ACCEPT",
 			],
 		],
-		monitor => [
+		intranet => [
 			[
-				'iptables', 'another.remote.host',
-				'-p tcp -m multiport --dports 22,80,443 -m comment --comment "whitelist-' . $user . '-' . $now_string . '" -j ACCEPT',
+				'iptables', 'intranet.yourdomain.tld',
+				"-p tcp -m multiport --dports 22,80,443 $iptables_comment -j ACCEPT",
 			],
 		],
 	);
@@ -283,23 +334,24 @@ sub open_firewalls {
 			my $fw   = shift @$args;
 			my $host = shift @$args;
 
-			my (@cmd, $ret);
+			my (@cmd, $ret, $errmsg);
 
 			if ($fw eq 'pf') {
 				@cmd = ($pfctl, '-q', '-t', $group, '-T', 'add', $ip);
 			}
 			elsif ($fw eq 'iptables') {
-				@cmd = join('; ', map { join(' ', @iptables_base) . ' ' . $_ } @$args);
+				@cmd = join('; ', map { join ' ', @iptables_base, $_ } @$args);
 			}
 			else {
 				die "Unknown firewall type in host_rules: $fw\n";
 			}
 
+			undef $ret;
+			undef $errmsg;
 			if ($host eq 'localhost') {
 				$ret = system(@cmd);
 			}
 			else {
-				undef $ret;
 				my $pid = fork;
 				if (! defined $pid) {
 					die "Couldn't fork: $!\n";
@@ -324,19 +376,32 @@ sub open_firewalls {
 					waitpid $pid, 0;
 					alarm 0;
 				};
-				$ret = $@ if $@;
+				$errmsg = $@ if $@;
 			}
 
 			if ($ret) {
-				if ($ret eq 'b0rken') {
-					error("Error with $host: access to this is broken right now\n");
+				my $errstr;
+				if ($ret == -1) {
+					$errstr = "failed to execute: $!";
 				}
-				elsif ($ret and $ret !~ /^-?\d+$/) {
-					error("Error with $host: $ret\n");
+				elsif ($ret & 127) {
+					$errstr = sprintf "child died with signal %d, %s coredump",
+						($ret & 127), ($ret & 128) ? 'with' : 'without';
 				}
 				else {
-					error("Error with $host: " . system_error_string($?) . "\n");
+					my $real = $ret >> 8;
+					if ($real != 0) {
+						$errstr = sprintf "child exited with value %d", $real;
+					}
 				}
+
+				if ($errstr) {
+					error("Error with $host: $errstr");
+					++$errors{$group};
+				}
+			}
+			elsif ($errmsg) {
+				error("Error with $host: $errmsg");
 				++$errors{$group};
 			}
 			else {
@@ -349,57 +414,37 @@ sub open_firewalls {
 		}
 	}
 
-
-	if (%errors) {
-		if (%success) {
-			$msg .= $q->p(
-				"Your IP address, $ip, has been added or re-added to the firewall"
-				. " whitelist of these servers: "
-				. join(', ', sort keys %success) . "."
-			);
-			$msg .= $q->p(
-				"But there were errors for these servers: " . join(', ', sort keys %errors) . "."
-			);
-		}
-		else {
-			$msg .= $q->p(
-				"There were errors adding your IP address, $ip, to the firewall whitelist."
-			);
-		}
-		$problems = ' about this problem';
-	}
-	elsif (! %success) {
-		$msg .= $q->p(
-			"You are not part of any access groups. Please have your manager contact"
-			. " the system administrator so you can be added to the appropriate group(s)."
+	if (%success) {
+		push @msg, "<p>Your IP address, $ip, has been added to the firewall whitelist of servers in these groups:</p>\n";
+		push @msg, "<ul>\n";
+		my %sites = (
+			intranet => {
+				Wiki => 'https://wiki.yourdomain.tld/',
+			},
 		);
+		for my $group (sort keys %success) {
+			push @msg, "<li>$group: ";
+			my $set = $sites{$group};
+			my @items;
+			for my $item (sort keys %$set) {
+				$item = qq{<a href="$set->{$item}">$item</a>} if $set->{$item};
+				push @items, $item;
+			}
+			push @msg, join(', ', @items);
+			push @msg, "</li>\n";
+		}
+		push @msg, "</ul>\n";
+
+		if (%errors) {
+			push @msg, "<p>But there were errors for these: " . join(', ', sort keys %errors) . ".</p>";
+			$problems = ' about this problem';
+		}
 	}
 	else {
-		$msg .= $q->p(
-			"Your IP address, $ip, has been added or re-added to the firewall whitelist"
-			. " of these servers: "
-			. join(', ', sort keys %success) . "."
-		);
-	}
-
-	if (%success) {
-		$msg .= $q->p(
-			"You should now be able to access "
-			. ($errors{everything} ? "some of " : '')
-			. "these sites or site groups:"
-		);
-		$msg .= "<ul>\n";
-		my %sites = (
-			site1 => 'https://your.site1/',
-			site2 => 'https://your.site2/',
-		);
-		@success{keys %sites} = values %sites if grep { $_ eq 'everything' } keys %success;
-		for my $item (sort keys %success) {
-			$item = qq{<a href="$sites{$item}">$item</a>} if $sites{$item};
-			$item = "<li>$item</li>\n";
-			$msg .= $item;
+		if (%errors) {
+			push @msg, "<p>There was a problem adding your IP address, $ip, to the firewall whitelist.</p>";
 		}
-		$msg .= "</ul>\n";
+		push @msg, "<p>You are not part of any access groups. Please contact your manager so you can be added as appropriate.</p>";
 	}
 
 	return;
@@ -408,28 +453,28 @@ sub open_firewalls {
 
 
 sub ask_for_id {
+	push @msg, qq{<form name="auth" method="post" action="" enctype="multipart/form-data">\n};
+	push @msg, qq{<table>\n};
 
-	# defeat browser form data caching by using new field names each time
-	my $uid = md5_hex($$ . time() . 's33kritz');
+	push @msg, qq{<tr>\n};
+	push @msg, qq{<td>Username:</td>\n};
+	push @msg, qq{<td><input type="text" name="firewall_user" autocomplete="off" size="20"></td>\n};
+	push @msg, qq{</tr>\n};
 
-	$msg .= $q->start_form(-action => '')
-		. $q->table(
-			$q->Tr(
-				$q->td('Username:'),
-				$q->td($q->textfield({ -name => 'firewall_user_' . $uid, -size => 20 })),
-			),
-			$q->Tr(
-				$q->td('Password:'),
-				$q->td($q->password_field({ -name => 'firewall_pass_' . $uid, -size => 20 })),
-			),
-			$q->Tr({ -colspan => 2 },
-				$q->td($q->submit({ -name => 'firewall_action', value => 'Log in' })),
-			),
-		)
-		. $q->end_form;
+	push @msg, qq{<tr>\n};
+	push @msg, qq{<td>Password:</td>\n};
+	push @msg, qq{<td><input type="password" name="firewall_pass" autocomplete="off" size="20"></td>\n};
+	push @msg, qq{</tr>\n};
 
+	push @msg, qq{<tr colspan="2">\n};
+	push @msg, qq{<td><input type="submit" name="firewall_action" value="Log in"></td>\n};
+	push @msg, qq{</tr>\n};
+
+	push @msg, qq{</table>\n};
+	push @msg, qq{</form>\n};
+
+	$onload = qq{ onLoad="document.auth.firewall_user.focus()"};
 	return;
-
 }
 
 
@@ -442,7 +487,7 @@ sub update_password {
 		$pwfile->update_user($user, $new_pass, 'changed=' . time());
 	};
 	undef $ok if $@;
-	perish("Error changing password for user '$user'\n") unless $ok;
+	perish("Error changing password for user '$user'") unless $ok;
 
 	return;
 
