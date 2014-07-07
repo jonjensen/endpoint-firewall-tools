@@ -14,6 +14,10 @@ before your drop rules:
 
 =cut
 
+# Changelog : 
+#
+# 20140707 - Emanuele 'Lele' Calo' - Added username in iptables comments feature
+# 20050304 - Jon Jensen - Initial version
 
 use warnings;
 no warnings 'qw';
@@ -24,14 +28,14 @@ use Sys::Syslog;
 my $table = 'dynamic_ip';
 my $iptables = '/sbin/iptables';
 
-
 #my $out = join "\n", map { "$_=$ENV{$_}" } sort keys %ENV;
 
 # Save important things before clearing tainted environment
 my $ip = $ENV{REMOTE_ADDR};
 my $user = $ENV{REMOTE_USER};
 my $secure = $ENV{HTTPS};
-my $uri = $ENV{SCRIPT_URI};
+my @fullhost = split(':', $ENV{HTTP_HOST});
+my $host = $fullhost[0];
 %ENV = ();
 
 openlog 'firewall CGI', 'pid nowait', 'LOG_AUTHPRIV';
@@ -61,7 +65,7 @@ END
 	announce("IP was already whitelisted");
 }
 else {
-	my @base = ($iptables, '-A', $table, '-s', $ip);
+	my @base = ($iptables, '-A', $table, '-s', $ip, '-m', 'comment', '--comment', $user . ' whitelisted ' . time());
 	for (
 		[qw( -p tcp -m multiport --dports 21,22 -j ACCEPT )],
 	) {
@@ -80,6 +84,7 @@ Content-type: text/html\r
 
 <html>
 <head>
+	<meta http-equiv="cache-control" content="no-cache">
 	<title>End Point Firewall</title>
 </head>
 <body>
