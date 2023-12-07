@@ -33,8 +33,7 @@ use utf8;
 use IO::Handle;
 use Sys::Syslog qw(:DEFAULT setlogsock);
 use CGI ();
-use Digest::MD5 qw(md5_hex);
-use Authen::Htpasswd ();
+use Apache::Htpasswd ();
 use DB_File;
 
 my $now_time = time();
@@ -49,7 +48,8 @@ my $email = 'someone@your.domain';
 
 # firewall opening settings
 my $command_timeout_seconds = 10;
-my $iptables = '/sbin/iptables';
+my $iptables = '/usr/sbin/iptables';  # customizable per-host below in %host_rules
+my $ip6tables = '/usr/sbin/ip6tables';  # customizable per-host below in %host_rules
 my $pfctl = '/sbin/pfctl';
 my $ssh = '/usr/bin/ssh';
 my $ssh_key = '/root/.ssh/id_rsa.firewall-whitelist';
@@ -61,6 +61,7 @@ die "This application may only be accessed via https.\n"
 	unless $ENV{HTTPS};
 
 my $ip = $ENV{REMOTE_ADDR};
+my $class = 4;
 my $q = CGI->new;
 my @params = $q->param;
 my $action = $q->param('firewall_action');
@@ -92,6 +93,10 @@ elsif ($ip =~ /^(\d+\.\d+\.\d+\.\d+)$/) {
 		if $ip eq '0.0.0.0' or $ip eq '255.255.255.255';
 	announce("Connection reported from $ip");
 }
+elsif ($ip =~ /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$/) {
+	$class = 6;
+	announce("Connection reported from $ip");
+}
 else {
 	perish("Connection from invalid IP address '$ip'");
 }
@@ -104,7 +109,7 @@ my $onload = '';
 my @msg;
 my $problems = ' if you run into any problems';
 
-my $pwfile = Authen::Htpasswd->new($users_file, { encrypt_hash => 'sha1' })
+my $pwfile = new Apache::Htpasswd({passwdFile => $users_file, ReadOnly => 1 })
 	or perish("Error connecting to password file $users_file");
 
 tie my %user_attempts, 'DB_File', $user_attempts_file
@@ -249,7 +254,7 @@ sub authenticate {
 	# check user + password
 	my $valid;
 	eval {
-		$valid = $pwfile->check_user_password($user, $pass);
+		$valid = $pwfile->htCheckPassword($user, $pass);
 	};
 	undef $valid if $@;
 	unless ($valid) {
@@ -306,18 +311,25 @@ sub open_firewalls {
 
 	my @iptables_base = ($iptables, '-A', 'dynamic_ip', '-s', $ip);
 
+	my $iptables_bin = 'iptables';
+	if ($class == 6)
+	{
+		$iptables_bin = 'ip6tables';
+		@iptables_base = ($ip6tables, '-A', 'dynamic_ip', '-s', $ip);
+	}
+
 	my $user = $1 if $user =~ /^(\w+)$/; # untaint
 	my $iptables_comment = '-m comment --comment "whitelist-' . $user . '-' . $now_time . '"';
 	my %host_rules = (
 		bastion => [
 			[
-				'iptables', 'localhost',
+				$iptables_bin, 'localhost',
 				"-p tcp --dport 22 $iptables_comment -j ACCEPT",
 			],
 		],
 		intranet => [
 			[
-				'iptables', 'intranet.yourdomain.tld',
+				$iptables_bin, 'intranet.yourdomain.tld',
 				"-p tcp -m multiport --dports 22,80,443 $iptables_comment -j ACCEPT",
 			],
 		],
@@ -339,7 +351,7 @@ sub open_firewalls {
 			if ($fw eq 'pf') {
 				@cmd = ($pfctl, '-q', '-t', $group, '-T', 'add', $ip);
 			}
-			elsif ($fw eq 'iptables') {
+			elsif ($fw =~ /\bip6?tables\b/) {
 				@cmd = join('; ', map { join ' ', @iptables_base, $_ } @$args);
 			}
 			else {
@@ -348,6 +360,7 @@ sub open_firewalls {
 
 			undef $ret;
 			undef $errmsg;
+			local $?;
 			if ($host eq 'localhost') {
 				$ret = system(@cmd);
 			}
@@ -358,7 +371,7 @@ sub open_firewalls {
 				}
 				elsif (! $pid) {
 					# child
-					exec(
+					my @ssh_cmd = (
 						$ssh,
 						'-axqT',
 						'-o', 'BatchMode=yes',
@@ -367,15 +380,18 @@ sub open_firewalls {
 						$host,
 						join(' ', @cmd),
 					);
+					print STDERR "Executing: @ssh_cmd\n";
+					exec(@ssh_cmd);
 				}
 				# parent
-				$ret = $?;
 				eval {
 					local $SIG{ALRM} = sub { kill 15, $pid; die "timeout\n" };
 					alarm $command_timeout_seconds;
 					waitpid $pid, 0;
+					$ret = $?;
 					alarm 0;
 				};
+				alarm 0;
 				$errmsg = $@ if $@;
 			}
 
