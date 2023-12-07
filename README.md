@@ -1,9 +1,7 @@
 # End Point Firewall Tools
-http://www.endpoint.com/
 
-These are scripts that we have used for many years at End Point to allow
-web-based temporary firewall whitelisting for users at otherwise blocked
-IP addresses.
+These are scripts that we have used for many years at [End Point](https://www.endpointdev.com/) to allow
+web-based temporary firewall whitelisting for users at otherwise blocked IP addresses.
 
 ## firewall-pf-flushtables
 
@@ -20,8 +18,10 @@ clear counters.
 This is the original, simple firewall whitelisting script that runs under
 suidperl. Set its permissions like this:
 
+```sh
 chown root:root $file
 chmod u=srx,go= $file
+```
 
 It is invoked by Apache as a CGI program, and counts on you setting Apache up
 with HTTP basic authentication to protect it.

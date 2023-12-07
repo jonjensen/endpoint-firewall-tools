@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 
 # clear failed user login attempt counter
-# by Jon Jensen <jon@endpoint.com>
+# by Jon Jensen <jon@endpointdev.com>
 # March 2007
 
 use warnings;

@@ -3,7 +3,7 @@
 =for comment
 
 firewall whitelisting CGI
-by Jon Jensen <jon@endpoint.com>
+by Jon Jensen <jon@endpointdev.com>
 2005-03-04
 
 Add these rules somewhere in your iptables configuration file,
