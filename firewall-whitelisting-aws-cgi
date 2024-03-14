@@ -1,0 +1,607 @@
+#!/usr/bin/env perl
+
+=for comment
+
+firewall whitelisting CGI program
+by Jon Jensen <jon@endpointdev.com>
+
+2005-03-04 - created
+2005-12-09 - support multiple host iptables changes
+2006-05-26 - support groups of users each with different server access
+2006-07-06 - tolerate groups without URLs in HTML output
+2006-09-20 - adapt for OpenBSD and pf tables on the local machine
+2006-09-21 - daemonize and make listen on UNIX socket to avoid need for suidperl
+2006-09-22 - re-unify and run under sudo
+2007-03-16 - switch to CGI-based authentication instead of HTTP basic auth;
+             limit number of bad attempts per user; quell pfctl success message;
+2007-06-29 - added support for remote pf firewall rule setting
+2008-04-02 - adapted for End Point by Kiel Christofferson;
+             added support for multiple commands per iptables run
+2011-02-16 - added pastebot access
+2011-12-28 - added use of COMMENT module with a timestamp
+2012-03-24 - remove trailing \n from syslog messages where it appears as \012
+           - start phasing out CGI module
+           - move to HTML5, don't cache, auto-select username field, turn off browser autocomplete
+2018-10-01 - Stripped out iptables support and replaced with support for Amazon security groups, by Ron Phipps
+
+=cut
+
+use strict;
+use warnings;
+no warnings 'qw';
+
+use local::lib '/home/firewall/perl5';
+use utf8;
+use IO::Handle;
+use Sys::Syslog qw(:DEFAULT setlogsock);
+use CGI ();
+use Authen::Htpasswd ();
+use Crypt::PasswdMD5 ();   # needed for Authen::Htpasswd to support MD5
+use DB_File;
+use Paws;
+use Paws::Credential::File;
+use Data::Dumper;
+use DateTime;
+
+my %host_rules = (
+	testapp => [
+		{
+			id      => 'sg-XXXXXXXXXXXXXXXXX',
+			description => 'Your app access',
+			profile => 'dev',
+			region  => 'us-gov-west-1',
+			port_ranges   => [
+				'80',
+				'443'
+			]
+		}
+	]
+);
+
+if (@ARGV > 0) {
+	if ($ARGV[0] eq 'clear_whitelist') {
+		clear_all_whitelist(%host_rules);
+		exit;
+	}
+}
+
+my $now_time = time();
+
+# authentication settings
+my $max_failed_attempts = 3;
+my $access_path = '/home/firewall/access';
+my $users_file = "$access_path/firewall.users";
+my $groups_file = "$access_path/firewall.groups";
+my $user_attempts_file = "$access_path/firewall.users.failed.attempts";
+my $credentials_file = '/home/firewall/.aws/credentials';
+
+*STDOUT->autoflush(1);
+*STDERR->autoflush(1);
+
+=for skip
+
+die "This application may only be accessed via https.\n"
+	unless $ENV{HTTPS} || $ENV{HTTP_X_FORWARDED_PROTO};
+
+=cut
+
+my $ip = $ENV{HTTP_X_FORWARDED_FOR} || $ENV{'REMOTE_HOST'} || $ENV{REMOTE_ADDR};
+($ip) = split /\s*,/, $ip;
+
+my $q = CGI->new;
+my @params = $q->param;
+my $action = $q->param('firewall_action');
+my $user = $q->param('firewall_user');
+my $pass = $q->param('firewall_pass');
+
+=for debugging
+
+print "Content-Type: text/html; charset=UTF-8\r\n";
+print "Cache-Control: private, no-store, no-cache\r\n";
+print "X-UA-Compatible: IE=edge,chrome=1\r\n";
+print "\r\n";
+
+print Dumper(@ARGV);
+
+foreach (sort keys %ENV) {
+	print "$_  =  $ENV{$_}\n";
+}
+
+print Dumper(%host_rules);
+
+print "\n\n";
+
+print "user: $user\n\n";
+exit;
+
+=cut
+
+# clear tainted environment
+%ENV = ();
+
+setlogsock 'unix';
+openlog 'firewall CGI', 'pid nowait', 'LOG_AUTH';
+
+
+# Validate source IP address
+
+if (! $ip) {
+	perish("Connection is missing IP address");
+}
+elsif ($ip =~ /^(\d+\.\d+\.\d+\.\d+)$/) {
+	@_ = split /\./, $1 || '';
+	my @ip;
+	for (@_) {
+		push @ip, $_ if $_ < 256;
+	}
+	perish("Invalid IP address")
+		unless @ip == 4;
+	$ip = join '.', @ip;
+	perish("Devious IP address: $ip")
+		if $ip eq '0.0.0.0' or $ip eq '255.255.255.255';
+	announce("Connection reported from $ip");
+}
+else {
+	perish("Connection from invalid IP address '$ip'");
+}
+
+
+# Deal with dual page personality:
+# ask for user info vs. process and open firewalls
+
+my $onload = '';
+my @msg;
+my $problems = ' if you run into any problems';
+
+my $pwfile = Authen::Htpasswd->new($users_file, { encrypt_hash => 'sha1' })
+	or perish("Error connecting to password file $users_file");
+
+tie my %user_attempts, 'DB_File', $user_attempts_file
+	or perish("Error tie-ing $user_attempts_file");
+
+if (! $action) {
+	announce("Initial connection made (no action specified)");
+	ask_for_id();
+}
+elsif ($action eq 'Log in') {
+	authenticate() and open_firewalls(%host_rules);
+}
+elsif ($action eq 'change_password') {
+	authenticate() and change_password();
+}
+else {
+	perish("Invalid form action attempted: $action");
+}
+
+
+# Return HTML page
+
+my $page_title = 'End Point Firewall';
+my $msg = join '', @msg;
+
+print "Content-Type: text/html; charset=UTF-8\r\n";
+print "Cache-Control: private, no-store, no-cache\r\n";
+print "X-UA-Compatible: IE=edge,chrome=1\r\n";
+print "\r\n";
+
+print <<END;
+<!doctype html>
+<!-- paulirish.com/2008/conditional-stylesheets-vs-css-hacks-answer-neither/ -->
+<!--[if lt IE 7]> <html class="no-js lt-ie9 lt-ie8 lt-ie7" lang="en"> <![endif]-->
+<!--[if IE 7]>    <html class="no-js lt-ie9 lt-ie8" lang="en"> <![endif]-->
+<!--[if IE 8]>    <html class="no-js lt-ie9" lang="en"> <![endif]-->
+<!--[if gt IE 8]><!--> <html class="no-js" lang="en"> <!--<![endif]-->
+
+<head>
+	<title>$page_title</title>
+	<style type="text/css">
+html { font-size: 100%; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
+html, button, input, select, textarea { font-family: sans-serif; color: #222; }
+body { margin: 1em; font-size: 1em; line-height: 1.4; }
+::-moz-selection { background: #fe57a1; color: #fff; text-shadow: none; }
+::selection { background: #fe57a1; color: #fff; text-shadow: none; }
+a { color: #00e; }
+a:visited { color: #551a8b; }
+a:hover { color: #06e; }
+a:focus { outline: thin dotted; }
+a:hover, a:active { outline: 0; }
+abbr[title] { border-bottom: 1px dotted; }
+b, strong { font-weight: bold; }
+blockquote { margin: 1em 40px; }
+dfn { font-style: italic; }
+hr { display: block; height: 1px; border: 0; border-top: 1px solid #ccc; margin: 1em 0; padding: 0; }
+ins { background: #ff9; color: #000; text-decoration: none; }
+mark { background: #ff0; color: #000; font-style: italic; font-weight: bold; }
+pre, code, kbd, samp { font-family: monospace, serif; _font-family: 'courier new', monospace; font-size: 1em; }
+pre { white-space: pre; white-space: pre-wrap; word-wrap: break-word; }
+q { quotes: none; }
+q:before, q:after { content: ""; content: none; }
+small { font-size: 85%; }
+sub, sup { font-size: 75%; line-height: 0; position: relative; vertical-align: baseline; }
+sup { top: -0.5em; }
+sub { bottom: -0.25em; }
+ul, ol { margin: 1em 0; padding: 0 0 0 40px; }
+dd { margin: 0 0 0 40px; }
+nav ul, nav ol { list-style: none; list-style-image: none; margin: 0; padding: 0; }
+img { border: 0; -ms-interpolation-mode: bicubic; vertical-align: middle; }
+svg:not(:root) { overflow: hidden; }
+figure { margin: 0; }
+form { margin: 0; }
+fieldset { border: 0; margin: 0; padding: 0; }
+label { cursor: pointer; }
+legend { border: 0; *margin-left: -7px; padding: 0; white-space: normal; }
+button, input, select, textarea { font-size: 100%; margin: 0; vertical-align: baseline; *vertical-align: middle; }
+button, input { line-height: normal; }
+button, input[type="button"], input[type="reset"], input[type="submit"] { cursor: pointer; -webkit-appearance: button; *overflow: visible; }
+button[disabled], input[disabled] { cursor: default; }
+input[type="checkbox"], input[type="radio"] { box-sizing: border-box; padding: 0; *width: 13px; *height: 13px; }
+input[type="search"] { -webkit-appearance: textfield; -moz-box-sizing: content-box; -webkit-box-sizing: content-box; box-sizing: content-box; }
+input[type="search"]::-webkit-search-decoration, input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
+button::-moz-focus-inner, input::-moz-focus-inner { border: 0; padding: 0; }
+textarea { overflow: auto; vertical-align: top; resize: vertical; }
+input:valid, textarea:valid {  }
+input:invalid, textarea:invalid { background-color: #f0dddd; }
+table { border-collapse: collapse; border-spacing: 0; }
+td { vertical-align: top; }
+	</style>
+</head>
+
+<body$onload>
+	<h1>$page_title</h1>
+	$msg
+</body>
+</html>
+END
+
+
+# Done!
+
+untie %user_attempts
+	or perish("Error untie-ing file $user_attempts_file!");
+
+announce("HTML response sent and all done");
+closelog;
+exit;
+
+
+# Utility routines
+
+sub announce {
+	syslog 'LOG_NOTICE', '%s', $_[0];
+	return;
+}
+
+sub error {
+	syslog 'LOG_ERR', '%s', $_[0];
+	return;
+}
+
+sub perish {
+	syslog 'LOG_ERR', '%s', $_[0];
+	closelog;
+	die @_;
+}
+
+
+# Authenticate the user
+
+sub authenticate {
+	# make sure user's not failed too many times
+	my $attempts = ++$user_attempts{$user};
+	if ($attempts > $max_failed_attempts) {
+		push @msg, qq{<p>Your account is locked due to too many failed login attempts. <b>It will be automatically unlocked later. Please wait and try again.</b>};
+		announce("Refused user '$user' because $attempts attempts have been made (limit of $max_failed_attempts allowed).");
+		$problems = ' to have your account unlocked';
+		return;
+	}
+
+	# check user + password
+	my $valid;
+	eval {
+		$valid = $pwfile->check_user_password($user, $pass);
+	};
+	undef $valid if $@;
+	unless ($valid) {
+		my $lockout = ($attempts >= $max_failed_attempts);
+		my $m = 'The username and password you provided are incorrect.';
+		$m .= ' Your account has now been locked due to too many failed login attempts. <b>Your account will be automatically unlocked after 30 minutes. Please wait 30 minutes and try again.</b> If you are still unable to log in, '
+			if $lockout;
+		push @msg, qq{<p>$m</p>};
+		ask_for_id() unless $lockout;
+		$problems = ' to have your account unlocked';
+		announce(
+			"Authentication for user '$user' failed"
+			. ($lockout
+				? " and account is now locked because the limit of"
+					. " $max_failed_attempts failed attempts has been reached"
+				: '')
+			. '.'
+		);
+		return;
+	}
+
+	announce("User '$user' authenticated.");
+
+	# reset failed attempt counter
+	$user_attempts{$user} = 0;
+
+	return 1;
+}
+
+
+# Open the firewall(s)
+
+sub open_firewalls {
+
+	my %host_rules = @_;
+
+	perish("open_firewalls called with no user specified!")
+		unless $user;
+
+	my $errmsg;
+
+	my $dt = DateTime->now;
+	my $date = $dt->ymd();
+	# Find out which groups the user is in
+
+	my %in_group;
+	{
+		local @ARGV = $groups_file;
+		while (<>) {
+			next if /^\s*$/ or /^\s*#/;
+			my ($group, $users) = /^\s*(\w+)\s*:\s*(.*)/
+				or perish("Invalid groups file");
+			$in_group{$group} = 1 if $users =~ /\b$user\b/;
+		}
+	}
+
+
+	my $user = $1 if $user =~ /^(\w+)$/; # untaint
+
+	# Open the appropriate firewall(s) for this user
+
+	my $success;
+	my $error_results;
+
+	for my $group (keys %in_group) {
+		my $argset = $host_rules{$group} or die "Missing rules for host $group?\n";
+
+		for my $arg (@$argset) {
+
+			if ($arg->{region} && $arg->{region} && $arg->{id} && (scalar(@{$arg->{port_ranges}}) > 0)) {
+
+				my $paws = Paws->new(config => {
+							credentials => Paws::Credential::File->new(
+								profile => $arg->{profile},
+								credentials_file => $credentials_file,
+							)
+						});
+
+				my $iam = $paws->service('EC2', region => $arg->{region});
+
+				foreach my $range (@{$arg->{port_ranges}}) {
+					my $from_port = $range;
+					my $to_port = $range;
+
+					if ($range =~ /:/) {
+						($from_port, $to_port) = split(/:/, $range);
+					}
+
+					eval {
+						my $res = $iam->AuthorizeSecurityGroupIngress(
+							GroupId         => $arg->{id},
+							IpPermissions   => [
+								{
+									FromPort    => $from_port,
+									ToPort      => $to_port,
+									IpProtocol  => 'TCP',
+									IpRanges    => [
+										{
+											CidrIp      =>  "$ip/32",
+											Description =>  "wl - $user: $date"
+										}
+									],
+								}
+							]
+						);
+					};
+
+					my $err = $@;
+					if ($err) {
+						if ($err->code ne 'InvalidPermission.Duplicate') {
+							$errmsg = $err->code . ": " . $err->message;
+							$error_results->{$group}->{$arg->{id}}->{$range} = $errmsg;
+							error("Error with $group: $errmsg");
+
+							next;
+						}
+					}
+
+					$success->{$group}->{$arg->{id}}->{range}->{$range} += 1;
+					$success->{$group}->{$arg->{id}}->{description} = $arg->{description};
+
+					my $logmsg = "IP has been added";
+					$logmsg .= ': ' . $ip . ' ' . $group . ' ' . $arg->{id} . ' ';
+					announce($logmsg);
+				}
+			}
+
+		}
+	}
+
+	if (scalar(keys %$success)) {
+		push @msg, "<p>Your IP address, $ip, has been added to the security groups in these groups:</p>\n";
+		push @msg, "<ul>\n";
+		push @msg, build_response($success);
+		push @msg, "</ul>\n";
+
+		if (scalar(keys %$error_results)) {
+			push @msg, "<p>But there were errors for these: </p>";
+			push @msg, "<ul>\n";
+			push @msg, build_response($error_results, 'error');
+			push @msg, "</ul>\n";
+			$problems = ' about this problem';
+		}
+	} else {
+		if (scalar(keys %$error_results)) {
+			push @msg, "<p>There was a problem adding your IP address, $ip to the security groups in these groups: </p>";
+			push @msg, "<ul>\n";
+			push @msg, build_response($error_results, 'error');
+			push @msg, "</ul>\n";
+		} else {
+			push @msg, "<p>You are not part of any access groups. Please contact your manager so you can be added as appropriate.</p>";
+		}
+	}
+
+	return;
+}
+
+sub build_response {
+	my $messages = shift;
+	my $msg_type = shift || 'success';
+	my $msg;
+
+	for my $group (sort keys %$messages) {
+		$msg .= "<li>$group<ul>\n";
+
+		for my $sg (sort keys %{$messages->{$group}}) {
+
+			$msg .= "<li>$messages->{$group}->{$sg}->{description} ($sg)<ul>\n";
+
+			for my $port_range (sort keys %{$messages->{$group}->{$sg}->{range}}) {
+				if ($msg_type eq 'success') {
+					$msg .= "<li>$port_range</li>\n";
+				} else {
+					$msg .= "<li>$port_range: " . $messages->{$group}->{$sg}->{range}->{$port_range} . "</li>\n";
+				}
+			}
+			$msg .= "</ul>\n";
+		}
+
+		$msg .= "</ul></li>\n";
+	}
+
+	return $msg;
+}
+
+
+sub ask_for_id {
+	push @msg, qq{<form name="auth" method="post" action="" enctype="multipart/form-data">\n};
+	push @msg, qq{<table>\n};
+
+	push @msg, qq{<tr>\n};
+	push @msg, qq{<td>Username:</td>\n};
+	push @msg, qq{<td><input type="text" name="firewall_user" autocomplete="off" size="20"></td>\n};
+	push @msg, qq{</tr>\n};
+
+	push @msg, qq{<tr>\n};
+	push @msg, qq{<td>Password:</td>\n};
+	push @msg, qq{<td><input type="password" name="firewall_pass" autocomplete="off" size="20"></td>\n};
+	push @msg, qq{</tr>\n};
+
+	push @msg, qq{<tr colspan="2">\n};
+	push @msg, qq{<td><input type="submit" name="firewall_action" value="Log in"></td>\n};
+	push @msg, qq{</tr>\n};
+
+	push @msg, qq{</table>\n};
+	push @msg, qq{</form>\n};
+
+	$onload = qq{ onLoad="document.auth.firewall_user.focus()"};
+	return;
+}
+
+sub build_region_list {
+	my %host_rules = @_;
+
+	my $region_list;
+
+	for my $group (keys %host_rules) {
+		my $argset = $host_rules{$group} or die "Missing rules for host $group?\n";
+
+		for my $arg (@$argset) {
+			$region_list->{$arg->{region}} = 1;
+		}
+	}
+
+	return $region_list;
+}
+
+sub build_region_profile_list {
+	my %host_rules = @_;
+
+	my $region_profile_list;
+
+	for my $group (keys %host_rules) {
+		my $argset = $host_rules{$group} or die "Missing rules for host $group?\n";
+
+		for my $arg (@$argset) {
+			$region_profile_list->{$arg->{region}}->{$arg->{profile}} = 1;
+		}
+	}
+
+	return $region_profile_list;
+}
+
+sub clear_all_whitelist {
+	my %host_rules = @_;
+
+	my $region_profile_list = build_region_profile_list(%host_rules);
+
+	for my $region (keys %$region_profile_list) {
+#		print $region;
+		for my $profile (keys %{$region_profile_list->{$region}}) {
+#			print $profile . "\n";
+
+			my $paws = Paws->new(config => {
+									credentials => Paws::Credential::File->new(
+									profile => $profile,
+									credentials_file => $credentials_file,
+								)
+			});
+
+			my $iam = $paws->service('EC2', region => $region);
+
+			my $secGroupsResult = $iam->DescribeSecurityGroups(
+				Filters => [
+					{
+						Name    => 'tag-key',
+						Values  => [ 'dynamic_whitelist' ],
+					},
+				]
+			)->SecurityGroups;
+
+#			print Dumper($secGroupsResult);
+
+			foreach my $sg (@$secGroupsResult) {
+				my $perms = $sg->IpPermissions;
+				foreach my $perm (@$perms) {
+					my $ranges = $perm->IpRanges;
+					foreach my $range (@$ranges) {
+						eval {
+							my $res = $iam->RevokeSecurityGroupIngress(
+								GroupId         => $sg->GroupId,
+								IpPermissions   => [
+									{
+										ToPort      => $perm->ToPort,
+										FromPort    => $perm->FromPort,
+										IpProtocol  => $perm->IpProtocol,
+										IpRanges    => [
+											{
+												CidrIp  => $range->CidrIp,
+											}
+										],
+									}
+								]
+							);
+						};
+
+						if ($@) {
+							print "there was an error";
+							print Dumper($@->message);
+						};
+					}
+				}
+			}
+		}
+	}
+}
