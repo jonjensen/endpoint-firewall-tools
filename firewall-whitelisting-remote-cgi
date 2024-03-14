@@ -22,7 +22,6 @@ by Jon Jensen <jon@endpointdev.com>
 2012-03-24 - remove trailing \n from syslog messages where it appears as \012
            - start phasing out CGI module
            - move to HTML5, don't cache, auto-select username field, turn off browser autocomplete
-next       - allow user to change password; allow admin to force user to change password
 
 =cut
 
@@ -476,21 +475,3 @@ sub ask_for_id {
 	$onload = qq{ onLoad="document.auth.firewall_user.focus()"};
 	return;
 }
-
-
-=for skip
-
-sub update_password {
-
-	my $ok;
-	eval {
-		$pwfile->update_user($user, $new_pass, 'changed=' . time());
-	};
-	undef $ok if $@;
-	perish("Error changing password for user '$user'") unless $ok;
-
-	return;
-
-}
-
-=cut
